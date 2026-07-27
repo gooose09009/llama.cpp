@@ -1,0 +1,178 @@
+name: Build Personal (5070Ti + 9850X3D)
+
+# Personal build for RTX 5070 Ti (Blackwell sm_120) + AMD Ryzen 7 9850X3D (Zen 5).
+# CUDA 13.1 (driver limited to 13.2, and 13.2 has known build issues).
+# Only adds this file, no modification to existing files, easy to sync with upstream.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_cuda:
+        description: 'Build CUDA backend (5070 Ti, sm_120a)'
+        type: boolean
+        default: true
+      build_cpu:
+        description: 'Build CPU backend + main tools (9850X3D, Zen 5 via zen4 variant)'
+        type: boolean
+        default: true
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+concurrency:
+  group: build-personal
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    if: ${{ inputs.build_cpu }}
+    runs-on: windows-2022
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: personal-windows-2022-x64-cpu
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            %CMAKE_ARGS%
+          cmake --build build --config Release
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: personal-windows-2022-x64-cpu
+
+      - name: Pack artifacts
+        shell: pwsh
+        run: |
+          # LLVM OpenMP runtime DLL. On windows-2022 (VS2022) the LLVM shipped via
+          # the VS component is at VC\Tools\Llvm\x64\bin; fall back to standalone LLVM.
+          $omp = Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\Llvm\x64\bin\libomp140.x86_64.dll" -ErrorAction SilentlyContinue
+          if (-not $omp) {
+            $omp = Get-ChildItem "C:\Program Files\LLVM\bin\libomp140.x86_64.dll" -ErrorAction SilentlyContinue
+          }
+          if ($omp) {
+            Write-Host "Copying OpenMP DLL from: $($omp.FullName)"
+            Copy-Item $omp.FullName .\build\bin\Release\
+          } else {
+            Write-Warning "libomp140.x86_64.dll not found, OpenMP CPU variants may fail to load"
+          }
+          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cpu-x64.zip
+          name: llama-bin-win-cpu-x64.zip
+
+  cuda:
+    if: ${{ inputs.build_cuda }}
+    runs-on: windows-2022
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Install Cuda Toolkit 13.1
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '13.1'
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: personal-windows-2022-x64-cuda-131
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
+        # GGML_CUDA_CUB_3DOT2 matches upstream release.yml (TODO there).
+        # CMAKE_CUDA_ARCHITECTURES=120a-real targets only RTX 5070 Ti (Blackwell sm_120),
+        # skipping older arches to cut compile time and binary size. Includes FP4 tensor cores.
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DCMAKE_CUDA_ARCHITECTURES="120a-real" ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: personal-windows-2022-x64-cuda-131
+
+      - name: Pack artifacts
+        run: |
+          7z a -snl llama-bin-win-cuda-13.1-x64.zip .\build\bin\Release\ggml-cuda.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda-13.1-x64.zip
+          name: llama-bin-win-cuda-13.1-x64.zip
+
+      - name: Copy and pack Cuda runtime
+        run: |
+          echo "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst='.\build\bin\cudart\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          7z a cudart-llama-bin-win-cuda-13.1-x64.zip $dst\*
+
+      - name: Upload Cuda runtime
+        uses: actions/upload-artifact@v6
+        with:
+          path: cudart-llama-bin-win-cuda-13.1-x64.zip
+          name: cudart-llama-bin-win-cuda-13.1-x64.zip
