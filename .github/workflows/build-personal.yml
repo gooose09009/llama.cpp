@@ -17,6 +17,7 @@ on:
         default: true
 
 env:
+  GH_TOKEN: ${{ github.token }}
   CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
 
 concurrency:
@@ -69,6 +70,7 @@ jobs:
 
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear
+        continue-on-error: true
         with:
           key: personal-windows-2022-x64-cpu
 
@@ -148,6 +150,7 @@ jobs:
 
       - name: ccache-clear
         uses: ./.github/actions/ccache-clear
+        continue-on-error: true
         with:
           key: personal-windows-2022-x64-cuda-131
 
