@@ -130,6 +130,9 @@ jobs:
         # GGML_CUDA_CUB_3DOT2 matches upstream release.yml (TODO there).
         # CMAKE_CUDA_ARCHITECTURES=120a-real targets only RTX 5070 Ti (Blackwell sm_120),
         # skipping older arches to cut compile time and binary size. Includes FP4 tensor cores.
+        # GGML_CUDA_FA_ALL_QUANTS: let flash attention accept mixed K/V cache types and
+        # q4_1/q5_0/q5_1 (upstream keeps it OFF to cut compile time across 7 arches;
+        # cost is bounded here with the single-arch build).
         run: |
           call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
           cmake -S . -B build -G "Ninja Multi-Config" ^
@@ -139,7 +142,8 @@ jobs:
             -DGGML_CUDA=ON ^
             -DCMAKE_CUDA_ARCHITECTURES="120a-real" ^
             -DLLAMA_BUILD_BORINGSSL=ON ^
-            -DGGML_CUDA_CUB_3DOT2=ON
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            -DGGML_CUDA_FA_ALL_QUANTS=ON
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
           cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
 
