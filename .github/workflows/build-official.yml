@@ -1,0 +1,243 @@
+name: Build Official-aligned (CUDA 13.1)
+
+# Replicates the official release.yml Windows cuda/cudart release artifacts in their
+# self-contained form (the release job merges the cpu package into the cuda zip), with
+# the CUDA version pinned to 13.1 only (driver limited to 13.2, and 13.2 has known
+# build issues). Only adds this file, no modification to existing files, easy to sync
+# with upstream.
+
+on:
+  workflow_dispatch:
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  BRANCH_NAME: ${{ github.head_ref || github.ref_name }}
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON"
+
+concurrency:
+  group: build-official
+  cancel-in-progress: true
+
+jobs:
+  cpu:
+    runs-on: windows-2025-vs2026
+
+    permissions:
+      actions: write
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: official-windows-2025-vs2026-x64-cpu
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_OPENMP=ON ^
+            %CMAKE_ARGS%
+          cmake --build build --config Release
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        continue-on-error: true
+        with:
+          key: official-windows-2025-vs2026-x64-cpu
+
+      - name: Pack artifacts
+        shell: pwsh
+        run: |
+          # LLVM OpenMP runtime DLL, pinned to the same path as upstream release.yml.
+          # If this breaks after a runner image update, sync the pin from upstream.
+          $omp = "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Redist\MSVC\14.51.36231\debug_nonredist\x64\Microsoft.VC145.OpenMP.LLVM\libomp140.x86_64.dll"
+          if (-not (Test-Path $omp)) {
+            throw "libomp140.x86_64.dll not found at $omp"
+          }
+          Copy-Item $omp .\build\bin\Release\
+          7z a -snl llama-bin-win-cpu-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cpu-x64.zip
+          name: llama-bin-win-cpu-x64.zip
+
+  cuda:
+    runs-on: windows-2022
+
+    permissions:
+      actions: write
+
+    strategy:
+      matrix:
+        # keep in sync with the merge job upload path
+        cuda: ['13.1']
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: "npm"
+          cache-dependency-path: "tools/ui/package-lock.json"
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+
+      - name: Install Ninja
+        id: install_ninja
+        run: |
+          choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: official-windows-2022-x64-cuda-${{ matrix.cuda }}
+
+      - name: Build
+        id: cmake_build
+        shell: cmd
+        # TODO: Remove GGML_CUDA_CUB_3DOT2 flag once CCCL 3.2 is bundled within CTK and that CTK version is used in this project
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% --target ggml-cuda
+
+      - name: ccache-clear
+        uses: ./.github/actions/ccache-clear
+        with:
+          key: official-windows-2022-x64-cuda-${{ matrix.cuda }}
+
+      - name: Pack artifacts
+        id: pack_artifacts
+        run: |
+          7z a -snl llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip .\build\bin\Release\ggml-cuda.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+
+      - name: Copy and pack Cuda runtime
+        run: |
+          echo "Cuda install location: ${{ env.CUDA_PATH }}"
+          $dst='.\build\bin\cudart\'
+          robocopy "${{env.CUDA_PATH}}\bin" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\lib" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          robocopy "${{env.CUDA_PATH}}\bin\x64" $dst cudart64_*.dll cublas64_*.dll cublasLt64_*.dll
+          7z a cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip $dst\*
+
+      - name: Upload Cuda runtime
+        uses: actions/upload-artifact@v6
+        with:
+          path: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          name: cudart-llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+
+  merge:
+    runs-on: ubuntu-slim
+
+    needs:
+      - cpu
+      - cuda
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine tag name
+        id: tag
+        uses: ./.github/actions/get-tag-name
+
+      - name: Download artifacts
+        id: download-artifact
+        uses: actions/download-artifact@v7
+        with:
+          pattern: llama-bin-win-*.zip
+          path: ./artifact
+          merge-multiple: true
+
+      # Simplified from upstream release.yml "Move artifacts" to x64 only (this
+      # workflow has no arm64 inputs; cudart-*.zip does not match llama-bin-win-*
+      # and is intentionally left untouched, same as upstream).
+      - name: Merge CPU backend into cuda zip
+        id: move_artifacts
+        run: |
+          mkdir -p release
+
+          echo "Adding CPU backend files to existing zips..."
+          cpu_zip="artifact/llama-bin-win-cpu-x64.zip"
+          temp_dir=$(mktemp -d)
+          echo "Extracting CPU backend for x64..."
+          unzip "$cpu_zip" -d "$temp_dir"
+
+          echo "Adding CPU files to x64 zips..."
+          for target_zip in artifact/llama-bin-win-*-x64.zip; do
+            if [[ "$target_zip" == "$cpu_zip" ]]; then
+              continue
+            fi
+            echo "Adding CPU backend to $(basename "$target_zip")"
+            realpath_target_zip=$(realpath "$target_zip")
+            (cd "$temp_dir" && zip -r "$realpath_target_zip" .)
+          done
+
+          rm -rf "$temp_dir"
+
+          echo "Renaming and moving zips to release..."
+          for zip_file in artifact/llama-bin-win-*.zip; do
+            base_name=$(basename "$zip_file" .zip)
+            zip_name="llama-${{ steps.tag.outputs.name }}-${base_name#llama-}.zip"
+            echo "Moving $zip_file to release/$zip_name"
+            mv "$zip_file" "release/$zip_name"
+          done
+
+      - name: Upload merged cpu zip
+        uses: actions/upload-artifact@v6
+        with:
+          path: release/llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip
+          name: llama-${{ steps.tag.outputs.name }}-bin-win-cpu-x64.zip
+
+      - name: Upload self-contained cuda zip
+        uses: actions/upload-artifact@v6
+        with:
+          path: release/llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
+          name: llama-${{ steps.tag.outputs.name }}-bin-win-cuda-13.1-x64.zip
